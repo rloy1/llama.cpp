@@ -86,6 +86,11 @@ uint32_t llama_hparams::n_embd_out() const {
 
 uint32_t llama_hparams::n_embd_head_k(uint32_t il) const {
     if (il < n_layer) {
+        // per-layer override (ragged MLA latent cache); 0 = not set
+        if (n_embd_head_k_arr[il] != 0) {
+            return n_embd_head_k_arr[il];
+        }
+
         return is_swa(il) ? n_embd_head_k_swa : n_embd_head_k_full;
     }
 
@@ -94,7 +99,20 @@ uint32_t llama_hparams::n_embd_head_k(uint32_t il) const {
 
 uint32_t llama_hparams::n_embd_head_v(uint32_t il) const {
     if (il < n_layer) {
+        // per-layer override (ragged MLA latent cache); 0 = not set
+        if (n_embd_head_v_arr[il] != 0) {
+            return n_embd_head_v_arr[il];
+        }
+
         return is_swa(il) ? n_embd_head_v_swa : n_embd_head_v_full;
+    }
+
+    GGML_ABORT("fatal error");
+}
+
+uint32_t llama_hparams::n_lora_kv_l(uint32_t il) const {
+    if (il < n_layer) {
+        return n_lora_kv_arr[il] != 0 ? n_lora_kv_arr[il] : n_lora_kv;
     }
 
     GGML_ABORT("fatal error");

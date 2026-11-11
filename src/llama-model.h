@@ -240,10 +240,16 @@ struct llama_layer {
     struct ggml_tensor * wqkv      = nullptr;
     struct ggml_tensor * wq_a      = nullptr;
     struct ggml_tensor * wq_b      = nullptr;
+    struct ggml_tensor * bq_b      = nullptr; // optional bias for wq_b (e.g. TransMLA conversions of bias-using base models)
     struct ggml_tensor * wkv_a_mqa = nullptr;
+    struct ggml_tensor * bkv_a_mqa = nullptr; // optional bias for wkv_a_mqa (same as above)
     struct ggml_tensor * wkv_b     = nullptr;
     struct ggml_tensor * wk_b      = nullptr;
     struct ggml_tensor * wv_b      = nullptr;
+    struct ggml_tensor * wk_rope_rot = nullptr; // qwen35-mla: precomputed exact K-rope rotation matrix, see qwen35_mla.py
+    struct ggml_tensor * wk_nope_rot = nullptr; // qwen35-mla: same rotation matrix as wk_rope_rot, remaining (nope) rows
+    struct ggml_tensor * wkv_a_from_k_normed = nullptr; // qwen35-mla: K-nope's exact contribution to kv_cmpr, takes already-normed+rotated K
+    struct ggml_tensor * wkv_a_v = nullptr; // qwen35-mla: V's exact contribution to kv_cmpr, takes the raw hidden state
     struct ggml_tensor * wq_cross  = nullptr;
     struct ggml_tensor * wk_cross  = nullptr;
     struct ggml_tensor * wv_cross  = nullptr;

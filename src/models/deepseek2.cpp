@@ -97,10 +97,15 @@ llm_build_deepseek2::llm_build_deepseek2(const llama_model & model, const llm_gr
                 q = ggml_mul_mat(ctx0, model.layers[il].wq_a, cur);
                 cb(q, "q", il);
 
-                q = build_norm(q, model.layers[il].attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
-                cb(q, "q", il);
+                if (model.layers[il].attn_q_a_norm) {
+                    q = build_norm(q, model.layers[il].attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
+                    cb(q, "q", il);
+                }
 
                 q = ggml_mul_mat(ctx0, model.layers[il].wq_b, q);
+                if (model.layers[il].bq_b) {
+                    q = ggml_add(ctx0, q, model.layers[il].bq_b);
+                }
                 cb(q, "q", il);
             } else {
                 q = ggml_mul_mat(ctx0, model.layers[il].wq, cur);
@@ -119,6 +124,9 @@ llm_build_deepseek2::llm_build_deepseek2(const llama_model & model, const llm_gr
             cb(q_pe, "q_pe", il);
 
             ggml_tensor * kv_cmpr_pe = ggml_mul_mat(ctx0, model.layers[il].wkv_a_mqa, cur);
+            if (model.layers[il].bkv_a_mqa) {
+                kv_cmpr_pe = ggml_add(ctx0, kv_cmpr_pe, model.layers[il].bkv_a_mqa);
+            }
             cb(kv_cmpr_pe, "kv_cmpr_pe", il);
 
             // split into {kv_lora_rank, n_tokens}
@@ -142,8 +150,17 @@ llm_build_deepseek2::llm_build_deepseek2(const llama_model & model, const llm_gr
                                  ext_factor, attn_factor, beta_fast, beta_slow);
             cb(k_pe, "k_pe", il);
 
-            kv_cmpr = build_norm(kv_cmpr, model.layers[il].attn_kv_a_norm, nullptr, LLM_NORM_RMS, il);
-            cb(kv_cmpr, "kv_cmpr", il);
+            if (model.layers[il].attn_kv_a_norm) {
+                kv_cmpr = build_norm(kv_cmpr, model.layers[il].attn_kv_a_norm, nullptr, LLM_NORM_RMS, il);
+                cb(kv_cmpr, "kv_cmpr", il);
+            } else {
+                // kv_cmpr is a view (leading kv_lora_rank columns of the wider
+                // kv_cmpr_pe row), not contiguous -- build_norm's ggml_rms_norm
+                // normally produces a fresh contiguous tensor as a side effect,
+                // which downstream reshape/mul ops rely on. Skipping the norm
+                // means we have to materialize that contiguity ourselves.
+                kv_cmpr = ggml_cont(ctx0, kv_cmpr);
+            }
 
             if (is_mla) {
                 // {n_embd_head_qk_nope, n_tokens, n_head}

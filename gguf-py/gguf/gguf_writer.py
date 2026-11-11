@@ -775,6 +775,9 @@ class GGUFWriter:
     def add_value_length_mla(self, length: int) -> None:
         self.add_uint32(Keys.Attention.VALUE_LENGTH_MLA.format(arch=self.arch), length)
 
+    def add_head_count_kv_real(self, count: int) -> None:
+        self.add_uint32(Keys.Attention.HEAD_COUNT_KV_REAL.format(arch=self.arch), count)
+
     def add_key_length_swa(self, length: int) -> None:
         self.add_uint32(Keys.Attention.KEY_LENGTH_SWA.format(arch=self.arch), length)
 

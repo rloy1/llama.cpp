@@ -226,6 +226,7 @@ llm_build_kimi_linear::llm_build_kimi_linear(const llama_model & model, const ll
             // k_pe is used directly without RoPE
             // Normalize kv_c
             kv_cmpr = build_norm(kv_cmpr, layer.attn_kv_a_norm, nullptr, LLM_NORM_RMS, il);
+            cb(kv_cmpr, "kv_cmpr_common", il);
 
             if (layer.wk_b && layer.wv_b) { // MLA KV cache enabled
                 // extract q_nope

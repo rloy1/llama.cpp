@@ -1332,6 +1332,16 @@ class TextModel(ModelBase):
         if chkhsh == "d4540891389ea895b53b399da6ac824becc30f2fba0e9ddbb98f92e55ca0e97c":
             # ref: https://huggingface.co/Qwen/Qwen3-Embedding-0.6B
             res = "qwen2"
+        if chkhsh == "1444df51289cfa8063b96f0e62b1125440111bc79a52003ea14b6eac7016fd5f":
+            # ref: https://huggingface.co/Qwen/Qwen3.5-9B-Instruct -- computed
+            # locally against Qwen3.5-4B's own tokenizer.json (same BPE
+            # pre-tokenizer family across Qwen3.5 model sizes). Was never
+            # registered in this checkout even though llama.cpp's C++ side
+            # already has a dedicated LLAMA_VOCAB_PRE_TYPE_QWEN35 waiting
+            # for this exact "qwen35" identifier (see llama-vocab.cpp) --
+            # a pre-existing gap for Qwen3.5 in general, not specific to
+            # any one conversion.
+            res = "qwen35"
         if chkhsh == "66b8d4e19ab16c3bfd89bce5d785fb7e0155e8648708a1f42077cb9fe002c273":
             # ref: https://huggingface.co/alvarobartt/grok-2-tokenizer
             res = "grok-2"
@@ -5279,6 +5289,216 @@ class Qwen3_5MoeTextModel(_LinearAttentionVReorderBase):
     model_arch = gguf.MODEL_ARCH.QWEN35MOE
 
 
+@ModelBase.register("Qwen35MLAForCausalLM")
+class Qwen35MLATextModel(_LinearAttentionVReorderBase):
+    """Hybrid: Qwen3.5's gated-delta-net linear-attention layers (untouched,
+    inherited verbatim from _LinearAttentionVReorderBase/Qwen3NextModel)
+    interleaved with DeepSeek-style MLA full-attention layers, for a
+    TransMLA-style conversion of Qwen3.5's 8 real (full_attention) layers.
+    See /mnt/models/projects/transmla/QWEN35_MLA_GUIDE.md and
+    qwen35_mla.py (the PyTorch conversion this reads) for the full picture.
+
+    The saved checkpoint's config.json is patched with a few extra custom
+    keys this conversion needs (mla_kv_lora_rank, mla_qk_rope_head_dim,
+    architectures=["Qwen35MLAForCausalLM"] to route here) -- see
+    patch_config_for_gguf.py.
+    """
+    model_arch = gguf.MODEL_ARCH.QWEN35_MLA
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        kv_lora_rank = self.hparams["mla_kv_lora_rank"]
+        qk_rope_head_dim = self.hparams["mla_qk_rope_head_dim"]
+        head_dim = self.hparams["head_dim"]
+        num_key_value_heads = self.hparams["num_key_value_heads"]
+
+        # MLA (via the absorption path) turns into MQA (1 KV group) --
+        # same reasoning DeepseekV2Model uses for its own set_gguf_parameters.
+        self.gguf_writer.add_head_count_kv(1)
+
+        # Per-layer latent rank ("ragged" KV cache), optional. The rank IS the
+        # cache width, and the converted layers do not need it equally -- a
+        # greedy search found that spending one budget unevenly beat spending it
+        # uniformly by ~9x on teacher-forced code-NLL at identical total cache.
+        #
+        # mla_kv_lora_rank_per_layer may be a list of block_count ranks or a
+        # {layer_index: rank} mapping. When it is absent this writes exactly the
+        # scalar it has always written, so uniform conversions are unchanged.
+        # llama.cpp reads this key with get_key_or_arr, which accepts either
+        # form, so a ragged gguf needs no new key and old ggufs still load.
+        per_layer = self.hparams.get("mla_kv_lora_rank_per_layer")
+        if per_layer:
+            if isinstance(per_layer, dict):
+                given = {int(k): int(v) for k, v in per_layer.items()}
+            else:
+                given = {i: int(r) for i, r in enumerate(per_layer)}
+            if not given:
+                raise ValueError("mla_kv_lora_rank_per_layer is empty")
+            bad = [i for i in given if not 0 <= i < self.block_count]
+            if bad:
+                raise ValueError(f"mla_kv_lora_rank_per_layer has out-of-range layers {bad} "
+                                 f"for block_count {self.block_count}")
+            # Unspecified layers are the linear-attention ones, which hold no
+            # latent cache at all. Fill them with the widest converted rank so
+            # the scalar key_length/value_length below describe the widest MLA
+            # layer exactly -- llama.cpp derives the decoupled-rope width as
+            # key_length - value_length, which only holds if both come from the
+            # same rank.
+            widest = max(given.values())
+            ranks = [given.get(i, widest) for i in range(self.block_count)]
+            kv_lora_rank = widest
+            self.gguf_writer.add_array(
+                gguf.Keys.Attention.KV_LORA_RANK.format(arch=self.gguf_writer.arch), ranks)
+            logger.info(f"ragged kv_lora_rank: {sorted(given.items())} "
+                        f"(widest {widest}, total {sum(given.values())})")
+        else:
+            self.gguf_writer.add_kv_lora_rank(kv_lora_rank)
+
+        # Generic key/value length -- these drive n_embd_k_gqa()/
+        # n_embd_v_gqa(), which is what the k-only MLA cache actually gets
+        # *sized* from (llama_memory_hybrid's tensor allocation), as
+        # opposed to the _mla variants below which only affect the graph
+        # builder's own Q/K/V view widths. Missing this crashed with a
+        # ggml_set_rows shape-mismatch assert on first load: the cache
+        # defaulted to hidden_size/n_head (160) instead of the true 320
+        # (kv_lora_rank + qk_rope_head_dim) k-cache row width.
+        self.gguf_writer.add_key_length(kv_lora_rank + qk_rope_head_dim)
+        self.gguf_writer.add_value_length(kv_lora_rank)
+        self.gguf_writer.add_key_length_mla(head_dim + qk_rope_head_dim)
+        self.gguf_writer.add_value_length_mla(head_dim)
+        # Real (pre-absorption) kv-head count -- distinct from the global
+        # head_count_kv=1 above, needed for the exact K-rope path's raw
+        # k_proj reshape (k_proj's un-compressed output is
+        # num_key_value_heads * head_dim wide, a different number than
+        # what head_count_kv=1 implies). See qwen35-mla.cpp.
+        self.gguf_writer.add_head_count_kv_real(num_key_value_heads)
+        # rope_dimension_count is the model's TRUE rotary width, which is
+        # partial_rotary_factor * head_dim -- NOT qk_rope_head_dim. Those are
+        # equal only at n_rope_ranks=1. At 4 ranks qk_rope_head_dim is 256
+        # (four blocks of 64) while the frequency width stays 64, and writing
+        # 256 here would have the graph assign frequencies over 256 dims
+        # instead of tiling the 64-frequency pattern four times.
+        #
+        # qwen35-mla.cpp derives the rope SLICE width as
+        # key_length_mla - value_length_mla and the tile count as that over
+        # n_rot, so both numbers have to be right for either to work.
+        prf = self.hparams.get("partial_rotary_factor", 1.0)
+        true_rotary = int(head_dim * prf)
+        assert qk_rope_head_dim % true_rotary == 0, (
+            f"qk_mqa_dim {qk_rope_head_dim} is not a whole number of rope "
+            f"ranks of the true rotary width {true_rotary}")
+        self.gguf_writer.add_rope_dimension_count(true_rotary)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name.endswith("q_proj_original.weight"):
+            # wq: raw, doubled-width (query + gate) -- gate-extraction only,
+            # see qwen35-mla.cpp. Direct pass-through, same tensor role
+            # qwen35.cpp's own wq already has.
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_Q, bid), data_torch)
+            return
+
+        if name.endswith("self_attn.q_proj.weight"):
+            # wq_b: compressed, rope-absorbed query (this conversion never
+            # uses q_lora_rank, so there's no wq_a step).
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_Q_B, bid), data_torch)
+            return
+
+        if name.endswith("k_proj_original.weight"):
+            # wk: raw, unmodified k_proj -- first stage of the exact
+            # K-rope path (see qwen35-mla.cpp): wk -> attn_k_norm ->
+            # attn_k_rope_rot. Direct pass-through, same tensor role
+            # qwen35.cpp's own wk already has for its (different) plain-
+            # GQA layers.
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_K, bid), data_torch)
+            return
+
+        if name.endswith("k_norm_original.weight"):
+            # attn_k_norm: the real per-head RMSNorm, second stage of the
+            # exact K-rope path. Same tensor role/shape as qwen35.cpp's
+            # own attn_k_norm.
+            #
+            # The +1 is MANDATORY and was missing. Qwen3_5RMSNorm computes
+            # x/rms(x) * (1.0 + weight) -- the weight is initialised to zeros
+            # and stores the OFFSET -- while llama.cpp's rms_norm multiplies by
+            # the weight directly. Qwen3NextModel.modify_tensors folds the +1 in
+            # for every tensor whose name ends "norm.weight", but this one is
+            # named "k_norm_original.weight", so it matched neither that rule nor
+            # this branch, and the raw offset shipped. llama.cpp then normalised
+            # K by mean 0.343 instead of 1.343.
+            #
+            # Measured consequence: k_nope_exact differed from the HF module by
+            # 88% at layer 3, every converted model rambled to the token cap
+            # regardless of rank/calibration/training, and base -- which takes
+            # the parent's +1 path -- was unaffected. It is the reason HF-side
+            # conversions measured near-perfect (kv1984-truerope: +0.05%
+            # perplexity) while the same GGUF scored 88% unsupported claims.
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_K_NORM, bid),
+                   data_torch + 1)
+            return
+
+        if name.endswith("k_rotation_rope_export"):
+            # attn_k_rope_rot: the precomputed exact rotation matrix,
+            # third and final stage of the exact K-rope path -- see
+            # qwen35_mla.py's Qwen35LoraQKV.__init__ for the identity-
+            # probe derivation that makes _freqfold_rotate's PCA rotation
+            # a single matmul here instead of needing its reshape/permute
+            # dance replicated in ggml.
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_K_ROPE_ROT, bid), data_torch)
+            return
+
+        if name.endswith("k_rotation_nope_export"):
+            # attn_k_nope_rot: same precomputed rotation matrix as above,
+            # just the remaining rows -- the exact K-nope path (see
+            # attn_kv_a_k_normed below) needs the nope-relevant rows of
+            # the identical rotation, for the identical reason.
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_K_NOPE_ROT, bid), data_torch)
+            return
+
+        if name.endswith("kv_a_from_k_normed.weight"):
+            # attn_kv_a_k_normed: K-nope's exact contribution to kv_cmpr,
+            # taking already-normed-and-rotated K as input (not the raw
+            # hidden state) -- see qwen35-mla.cpp and qwen35_mla.py's
+            # module docstring for why this replaces the old fused
+            # kv_a_proj_with_mqa (a single hidden_state->kv_lora_rank
+            # matrix that had no place left to inject K's RMS correction).
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_KV_A_K_NORMED, bid), data_torch)
+            return
+
+        if name.endswith("kv_a_v_only.weight"):
+            # attn_kv_a_v: V's exact contribution to kv_cmpr, taking the
+            # raw hidden state (V never had a norm in the original model).
+            # Summed with attn_kv_a_k_normed's output at runtime.
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_KV_A_V, bid), data_torch)
+            return
+
+        if name.endswith("kv_b_proj.weight"):
+            # Split into wk_b/wv_b for the MLA absorption path -- same
+            # transform DeepseekV2Model uses for its own kv_b_proj, except
+            # K comes first within each head's block here (not V first,
+            # see Qwen35LoraQKV.forward()'s kv_nope.split([head_dim,
+            # head_dim]) -- k_nope, then value_states).
+            n_head = self.hparams["num_attention_heads"]
+            head_dim = self.hparams["head_dim"]
+            assert data_torch.shape[0] == n_head * 2 * head_dim
+
+            kv_b = data_torch.view(n_head, 2 * head_dim, data_torch.shape[-1])
+            k_b, v_b = torch.split(kv_b, [head_dim, head_dim], dim=1)
+            k_b = k_b.transpose(1, 2)
+
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_K_B, bid), k_b)
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_V_B, bid), v_b)
+            return
+
+        if name.endswith("self_attn.o_proj.weight"):
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_OUT, bid), data_torch)
+            return
+
+        # Everything else (embeddings, norms, FFN, and every linear_attn.*
+        # tensor on the untouched layers) goes through the inherited,
+        # already-correct Qwen3.5/Qwen3Next generic mapping unchanged.
+        yield from super().modify_tensors(data_torch, name, bid)
+
+
 @ModelBase.register("GPT2LMHeadModel")
 class GPT2Model(TextModel):
     model_arch = gguf.MODEL_ARCH.GPT2
@@ -8831,6 +9051,38 @@ class DeepseekV2Model(TextModel):
         except Exception:
             pass
 
+        # A TransMLA conversion of a non-DeepSeek model lands here: the
+        # architecture label is DeepseekV3ForCausalLM but the tokenizer is
+        # whatever the SOURCE model shipped. Mistral-7B-v0.3 declares
+        # model.type "BPE" in tokenizer.json while actually being
+        # SentencePiece -- pre_tokenizer is Metaspace with the U+2581
+        # replacement and a ByteFallback decoder -- so its chkhsh is absent
+        # from get_vocab_base_pre() and should stay absent. Registering that
+        # hash against an arbitrary BPE pre-tokenizer would export a vocab
+        # that silently mis-tokenizes, and the resulting perplexity would be
+        # blamed on the MLA conversion rather than on the tokenizer.
+        #
+        # Detect the SentencePiece shape and take the path every Mistral GGUF
+        # has always used. Only reachable once _set_vocab_gpt2 has failed.
+        if (self.dir_model / "tokenizer.model").is_file():
+            metaspace = False
+            tok_json = self.dir_model / "tokenizer.json"
+            if tok_json.is_file():
+                try:
+                    with open(tok_json, encoding="utf-8") as f:
+                        pre = json.load(f).get("pre_tokenizer") or {}
+                    metaspace = pre.get("type") == "Metaspace"
+                except Exception:
+                    metaspace = False
+            else:
+                metaspace = True
+            if metaspace:
+                logger.info("vocab: SentencePiece shape detected (tokenizer.model "
+                             "+ Metaspace pre-tokenizer) -- using the sentencepiece "
+                             "path instead of BPE")
+                self._set_vocab_sentencepiece()
+                return
+
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(self.dir_model, trust_remote_code=True)
         tokpre = self.get_vocab_base_pre(tokenizer)
@@ -8905,6 +9157,16 @@ class DeepseekV2Model(TextModel):
         self.gguf_writer.add_vocab_size(hparams["vocab_size"])
         if "q_lora_rank" in hparams and hparams["q_lora_rank"] is not None:
             self.gguf_writer.add_q_lora_rank(hparams["q_lora_rank"])
+        else:
+            # llama.cpp's deepseek2 loader treats q_lora_rank as a REQUIRED key
+            # and refuses the model outright if it is absent, even though the
+            # C++ then guards every use with `if (q_lora_rank > 0)`. Real
+            # DeepSeek-V2/V3 always factorise Q so the key is always present
+            # upstream; a TransMLA conversion of a model with a plain q_proj
+            # (Mistral-7B-v0.3) does not, and the load fails with
+            # "key not found in model: deepseek2.attention.q_lora_rank".
+            # 0 is the truthful value and the one the guarded path expects.
+            self.gguf_writer.add_q_lora_rank(0)
 
         # note: deepseek2 using MLA converts into MQA with larger heads, then decompresses to MHA
         if not is_ocr:

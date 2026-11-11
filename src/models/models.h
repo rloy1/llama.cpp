@@ -614,6 +614,43 @@ private:
     const llama_model & model;
 };
 
+// Hybrid: LLM_ARCH_QWEN35's gated-delta-net linear-attention layers
+// (unchanged, reused verbatim) interleaved with DeepSeek-style MLA
+// full-attention layers (replacing LLM_ARCH_QWEN35's own plain gated-GQA
+// full attention) -- see qwen35-mla.cpp and
+// /mnt/models/projects/transmla/QWEN35_MLA_GUIDE.md.
+struct llm_build_qwen35_mla : public llm_build_delta_net_base {
+    llm_build_qwen35_mla(const llama_model & model, const llm_graph_params & params);
+private:
+    ggml_tensor * build_layer_attn_mla(
+    llm_graph_input_attn_k * inp_attn,
+                ggml_tensor * cur,
+                ggml_tensor * inp_pos,
+                        int * sections,
+                        int   il);
+
+    ggml_tensor * build_layer_attn_linear(
+         llm_graph_input_rs * inp,
+                ggml_tensor * cur,
+                        int   il);
+
+    ggml_tensor * build_layer_ffn(
+                ggml_tensor * cur,
+                        int   il);
+
+    ggml_tensor * build_norm_gated(
+                ggml_tensor * input,
+                ggml_tensor * weights,
+                ggml_tensor * gate,
+                        int   layer);
+
+    std::pair<ggml_tensor *, ggml_tensor *> build_qkvz(
+                ggml_tensor * input,
+                        int   il);
+
+    const llama_model & model;
+};
+
 // TODO: derive llm_build_delta_net_base instead
 struct llm_build_qwen35moe : public llm_build_delta_net_base {
     llm_build_qwen35moe(const llama_model & model, const llm_graph_params & params);

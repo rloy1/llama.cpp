@@ -2085,6 +2085,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(
+        {"--save-token-nll"}, "FNAME",
+        "save per-token NLL to FNAME as sparse 'position value' lines -- only positions the "
+        "chunking scheme actually scores get a line, unscored positions (the first half of "
+        "each chunk, by design) are simply absent rather than written as zero",
+        [](common_params & params, const std::string & value) {
+            params.token_nll_file = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_PERPLEXITY}));
+    add_opt(common_arg(
         {"--ppl-stride"}, "N",
         string_format("stride for perplexity calculation (default: %d)", params.ppl_stride),
         [](common_params & params, int value) {

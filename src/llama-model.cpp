@@ -2785,6 +2785,95 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     default: type = LLM_TYPE_UNKNOWN;
                 }
             } break;
+        case LLM_ARCH_QWEN35_MLA:
+            {
+                // Hybrid: Qwen3.5's gated-delta-net linear-attention layers
+                // (unchanged) interleaved with DeepSeek-style MLA full-attention
+                // layers (replacing Qwen3.5's own plain gated-GQA full-attention
+                // layers) for a small number of layers where a TransMLA-style
+                // conversion has been applied. See
+                // /mnt/models/projects/transmla/QWEN35_MLA_GUIDE.md for the
+                // conversion this arch is meant to load.
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
+                ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS,    hparams.rope_sections, 4, true);
+
+                // Linear attention (gated delta net) parameters -- verbatim
+                // from LLM_ARCH_QWEN35, unchanged layers use identical math.
+                ml.get_key(LLM_KV_SSM_CONV_KERNEL,    hparams.ssm_d_conv);
+                ml.get_key(LLM_KV_SSM_INNER_SIZE,     hparams.ssm_d_inner);
+                ml.get_key(LLM_KV_SSM_STATE_SIZE,     hparams.ssm_d_state);
+                ml.get_key(LLM_KV_SSM_TIME_STEP_RANK, hparams.ssm_dt_rank);
+                ml.get_key(LLM_KV_SSM_GROUP_COUNT,    hparams.ssm_n_group);
+
+                // MLA parameters -- same keys DeepSeek2 uses. n_rot (the
+                // decoupled rope width, qk_mqa_dim) comes from the generic
+                // LLM_KV_ROPE_DIMENSION_COUNT read earlier in this function.
+                //
+                // kv_lora_rank is read as "scalar OR n_layer array". A uniform
+                // model writes the plain scalar it always wrote and
+                // get_key_or_arr broadcasts it across every layer, so GGUFs
+                // built before per-layer rank existed load to identical
+                // hparams. A ragged model writes one rank per layer.
+                ml.get_key_or_arr(LLM_KV_ATTENTION_KV_LORA_RANK, hparams.n_lora_kv_arr, hparams.n_layer);
+                // Keep the scalar as the MAXIMUM across layers: the remaining
+                // scalar consumers are size estimates and llama-model-saver, so
+                // over-reserving is safe where under-reserving would not be.
+                hparams.n_lora_kv = *std::max_element(hparams.n_lora_kv_arr.begin(),
+                                                      hparams.n_lora_kv_arr.begin() + hparams.n_layer);
+                ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH_MLA,   hparams.n_embd_head_k_mla_impl, false);
+                ml.get_key(LLM_KV_ATTENTION_VALUE_LENGTH_MLA, hparams.n_embd_head_v_mla_impl, false);
+                // Real (pre-absorption) kv-head count, distinct from the
+                // global n_head_kv=1 this arch writes for k-only MLA cache
+                // sizing -- needed for the exact K-rope path's raw k_proj
+                // reshape (see qwen35-mla.cpp).
+                ml.get_key(LLM_KV_ATTENTION_HEAD_COUNT_KV_REAL, hparams.n_head_kv_real);
+
+                // Mark recurrent (linear-attention) layers -- same
+                // interval-based derivation as LLM_ARCH_QWEN35.
+                {
+                    uint32_t full_attn_interval = 4;
+                    ml.get_key(LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval, false);
+                    for (uint32_t i = 0; i < hparams.n_layer; ++i) {
+                        hparams.recurrent_layer_arr[i] = ((i + 1) % full_attn_interval != 0);
+                    }
+                }
+
+                // Per-layer KV cache widths, derived from the per-layer rank.
+                //
+                // key_length/value_length deliberately stay SCALARS in the
+                // gguf: the generic hparams code above reads both with
+                // ml.get_key() into n_embd_head_k_full/n_embd_head_v_full, and
+                // get_key() throws on an array-typed key, so writing them as
+                // arrays would break loading before reaching this switch. The
+                // rank is the single source of truth instead, and the two
+                // scalars describe the widest layer:
+                //
+                //   value_length = max rank                 (latent only)
+                //   key_length   = max rank + rope width    (latent + k_pe)
+                //
+                // so the decoupled-rope width is just their difference, and a
+                // uniform model reproduces its own scalars exactly (576-512=64
+                // today). Recurrent layers are left at 0, i.e. no override, so
+                // nothing about the linear-attention layers changes.
+                {
+                    GGML_ASSERT(hparams.n_embd_head_k_full > hparams.n_embd_head_v_full);
+                    const uint32_t rope_w = hparams.n_embd_head_k_full - hparams.n_embd_head_v_full;
+
+                    for (uint32_t i = 0; i < hparams.n_layer; ++i) {
+                        if (hparams.recurrent_layer_arr[i]) {
+                            continue;
+                        }
+
+                        const uint32_t r = hparams.n_lora_kv_arr[i];
+                        GGML_ASSERT(r > 0);
+
+                        hparams.n_embd_head_v_arr[i] = r;
+                        hparams.n_embd_head_k_arr[i] = r + rope_w;
+                    }
+                }
+
+                type = LLM_TYPE_4B;
+            } break;
         case LLM_ARCH_QWEN35MOE:
             {
                 ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
@@ -5378,19 +5467,31 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
                         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
                         if (q_lora_rank > 0) {
-                            layer.attn_q_a_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_A_NORM, "weight", i), {q_lora_rank}, 0);
+                            // optional: training-free conversions (e.g. TransMLA without
+                            // --use-qkv-norm) skip this norm entirely rather than insert an
+                            // uncalibrated operation into a PCA-fitted linear decomposition.
+                            // Real DeepSeek-V3 always has it; stock deepseek2 GGUFs must keep
+                            // loading either way, so this stays TENSOR_NOT_REQUIRED.
+                            layer.attn_q_a_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_A_NORM, "weight", i), {q_lora_rank}, TENSOR_NOT_REQUIRED);
                         }
 
-                        layer.attn_kv_a_norm = create_tensor(tn(LLM_TENSOR_ATTN_KV_A_NORM, "weight", i), {kv_lora_rank}, 0);
+                        // same rationale as attn_q_a_norm above
+                        layer.attn_kv_a_norm = create_tensor(tn(LLM_TENSOR_ATTN_KV_A_NORM, "weight", i), {kv_lora_rank}, TENSOR_NOT_REQUIRED);
 
                         if (q_lora_rank > 0) {
                             layer.wq_a = create_tensor(tn(LLM_TENSOR_ATTN_Q_A, "weight", i), {n_embd, q_lora_rank}, 0);
                             layer.wq_b = create_tensor(tn(LLM_TENSOR_ATTN_Q_B, "weight", i), {q_lora_rank, n_head * n_embd_head_k_mla}, 0);
+                            // optional: base models with attention_bias=true (e.g. Qwen2) carry a bias
+                            // through TransMLA conversion here. Real DeepSeek-V3 never has one, so this
+                            // must stay TENSOR_NOT_REQUIRED for stock deepseek2 GGUFs to keep loading.
+                            layer.bq_b = create_tensor(tn(LLM_TENSOR_ATTN_Q_B, "bias", i), {n_head * n_embd_head_k_mla}, TENSOR_NOT_REQUIRED);
                         } else {
                             layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "weight", i), {n_embd, n_head * n_embd_head_k_mla}, 0);
                         }
 
                         layer.wkv_a_mqa = create_tensor(tn(LLM_TENSOR_ATTN_KV_A_MQA, "weight", i), {n_embd, kv_lora_rank + n_embd_head_qk_rope}, 0);
+                        // same rationale as bq_b above
+                        layer.bkv_a_mqa = create_tensor(tn(LLM_TENSOR_ATTN_KV_A_MQA, "bias", i), {kv_lora_rank + n_embd_head_qk_rope}, TENSOR_NOT_REQUIRED);
 
                         // note: only old legacy GGUF files will have the unsplit wkv_b tensor in
                         if (is_mla) {
@@ -7822,6 +7923,130 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
                     }
                 } break;
+            case LLM_ARCH_QWEN35_MLA:
+                {
+                    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
+
+                    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
+                    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
+                    if (output == NULL) {
+                        output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
+                    }
+
+                    // Linear-attention (gated delta net) dims -- verbatim from LLM_ARCH_QWEN35.
+                    const int64_t head_k_dim = hparams.ssm_d_state;
+                    const int64_t head_v_dim = hparams.ssm_d_state;
+                    const int64_t n_k_heads  = hparams.ssm_n_group;
+                    const int64_t n_v_heads  = hparams.ssm_dt_rank;
+                    const int64_t key_dim    = head_k_dim * n_k_heads;
+                    const int64_t value_dim  = head_v_dim * n_v_heads;
+                    const int64_t conv_dim   = key_dim * 2 + value_dim;
+
+                    // MLA dims for the full-attention layers -- same
+                    // convention as LLM_ARCH_DEEPSEEK2/LLM_ARCH_KIMI_LINEAR.
+                    //
+                    // kv_lora_rank is deliberately NOT hoisted here: it is
+                    // per-layer for this arch (see n_lora_kv_arr), so it is
+                    // fetched inside the layer loop below. Everything else in
+                    // this block is rank-independent.
+                    const int64_t n_embd_head_k_mla   = hparams.n_embd_head_k_mla();
+                    const int64_t n_embd_head_v_mla   = hparams.n_embd_head_v_mla();
+                    // Must match qwen35-mla.cpp's derivation exactly. The
+                    // rope-carrying slice is n_rope_ranks blocks of the true
+                    // rotary width, so its width is key_length_mla -
+                    // value_length_mla, NOT n_rot. Those coincide only at
+                    // n_rope_ranks=1 (320-256 = 64 = n_rot); at 4 ranks the
+                    // slice is 256 while n_rot stays 64.
+                    //
+                    // Deriving nope as n_embd_head_k_mla - n_rot gave 448
+                    // instead of 256 at 4 ranks, so wq's expected width came out
+                    // 2*16*448 = 14336 against the real 8192 and the model
+                    // refused to load. The dims check earned its keep.
+                    const int64_t n_embd_head_qk_nope = n_embd_head_v_mla;
+                    const int64_t n_embd_head_qk_rope = n_embd_head_k_mla - n_embd_head_qk_nope;
+                    GGML_ASSERT(n_embd_head_qk_nope >= 1);
+                    GGML_ASSERT(n_embd_head_qk_rope % hparams.n_rot() == 0);
+
+                    for (int i = 0; i < n_layer; ++i) {
+                        auto & layer = layers[i];
+
+                        layer.attn_norm      = create_tensor(tn(LLM_TENSOR_ATTN_NORM,      "weight", i), { n_embd }, 0);
+                        layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", i), { n_embd }, 0);
+
+                        if (hparams.is_recurrent(i)) {
+                            // Linear attention (gated delta net) -- verbatim from LLM_ARCH_QWEN35.
+                            layer.wqkv           = create_tensor(tn(LLM_TENSOR_ATTN_QKV,       "weight", i), { n_embd, key_dim * 2 + value_dim }, TENSOR_NOT_REQUIRED);
+                            layer.wqkv_gate      = create_tensor(tn(LLM_TENSOR_ATTN_GATE,      "weight", i), { n_embd, value_dim }, TENSOR_NOT_REQUIRED);
+                            layer.ssm_conv1d     = create_tensor(tn(LLM_TENSOR_SSM_CONV1D,     "weight", i), { hparams.ssm_d_conv, conv_dim }, 0);
+                            layer.ssm_dt         = create_tensor(tn(LLM_TENSOR_SSM_DT,         "bias",   i), { hparams.ssm_dt_rank }, 0);
+                            layer.ssm_a          = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN,             i), { hparams.ssm_dt_rank }, 0);
+                            layer.ssm_beta       = create_tensor(tn(LLM_TENSOR_SSM_BETA,       "weight", i), { n_embd, n_v_heads }, 0);
+                            layer.ssm_alpha      = create_tensor(tn(LLM_TENSOR_SSM_ALPHA,      "weight", i), { n_embd, n_v_heads }, 0);
+                            layer.ssm_norm       = create_tensor(tn(LLM_TENSOR_SSM_NORM,       "weight", i), { head_v_dim }, 0);
+                            layer.ssm_out        = create_tensor(tn(LLM_TENSOR_SSM_OUT,        "weight", i), { value_dim, n_embd }, 0);
+                        } else {
+                            // MLA full-attention layer.
+                            //
+                            // The latent rank is PER LAYER: the four tensors
+                            // below are the only rank-dependent weights, and a
+                            // ragged allocation makes each converted layer's
+                            // rank (and so its slice of the KV cache) differ.
+                            // For a uniform model this is the old scalar.
+                            const int64_t kv_lora_rank = hparams.n_lora_kv_l(i);
+
+                            // wq: raw, doubled-width (query + Qwen3.5's own
+                            // sigmoid attention-gate packed together, same
+                            // convention as LLM_ARCH_QWEN35's wq) -- used
+                            // ONLY to extract the gate here (view-sliced in
+                            // the graph builder), since the actual MLA query
+                            // comes from wq_b below instead.
+                            layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "weight", i), { n_embd, n_embd_head_qk_nope * n_head * 2 }, 0);
+
+                            // wq_b: compressed, rope-absorbed query, ready
+                            // for the MLA nope/rope split -- same role as
+                            // DeepSeek2's wq_b, just without a wq_a/q_lora
+                            // step (this conversion never compresses Q).
+                            layer.wq_b = create_tensor(tn(LLM_TENSOR_ATTN_Q_B, "weight", i), { n_embd, n_head * n_embd_head_k_mla }, 0);
+
+                            // K-nope's and V's separate, exact contributions
+                            // to kv_cmpr (replaces a single fused, from-
+                            // hidden-state-only wkv_a_mqa, which had no
+                            // place left to inject K's per-token RMS
+                            // correction -- see qwen35_mla.py's module
+                            // docstring). wkv_a_from_k_normed takes already
+                            // normed+rotated K-nope as input (below), not
+                            // the raw hidden state; wkv_a_v takes the raw
+                            // hidden state directly, same as the old
+                            // wkv_a_mqa did (V never had a norm to correct).
+                            const int64_t latent_dim = hparams.n_head_kv_real * n_embd_head_v_mla;
+                            const int64_t n_embd_head_qk_nope_kv = latent_dim - n_embd_head_qk_rope;
+                            layer.wkv_a_from_k_normed = create_tensor(tn(LLM_TENSOR_ATTN_KV_A_K_NORMED, "weight", i), { n_embd_head_qk_nope_kv, kv_lora_rank }, 0);
+                            layer.wkv_a_v             = create_tensor(tn(LLM_TENSOR_ATTN_KV_A_V, "weight", i), { n_embd, kv_lora_rank }, 0);
+                            layer.wk_b      = create_tensor(tn(LLM_TENSOR_ATTN_K_B, "weight", i), { n_embd_head_qk_nope, kv_lora_rank, n_head }, 0);
+                            layer.wv_b      = create_tensor(tn(LLM_TENSOR_ATTN_V_B, "weight", i), { kv_lora_rank, n_embd_head_v_mla, n_head }, 0);
+
+                            // Exact K-rope/K-nope paths: raw (unmodified)
+                            // k_proj, its real per-head RMSNorm, and the
+                            // precomputed rotation matrix that replicates
+                            // Qwen35PartialRope._freqfold_rotate exactly
+                            // (see qwen35_mla.py's k_rotation_rope_export/
+                            // k_rotation_nope_export for the identity-probe
+                            // derivation) -- normalize once, then rotate
+                            // into both the rope slice and the nope slice
+                            // that feeds wkv_a_from_k_normed above.
+                            layer.wk           = create_tensor(tn(LLM_TENSOR_ATTN_K, "weight", i), { n_embd, latent_dim }, 0);
+                            layer.attn_k_norm  = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), { n_embd_head_v_mla }, 0);
+                            layer.wk_rope_rot  = create_tensor(tn(LLM_TENSOR_ATTN_K_ROPE_ROT, "weight", i), { latent_dim, n_embd_head_qk_rope }, 0);
+                            layer.wk_nope_rot  = create_tensor(tn(LLM_TENSOR_ATTN_K_NOPE_ROT, "weight", i), { latent_dim, n_embd_head_qk_nope_kv }, 0);
+
+                            layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), { n_head * n_embd_head_v_mla, n_embd }, 0);
+                        }
+
+                        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
+                        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
+                        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
+                    }
+                } break;
             case LLM_ARCH_MIMO2:
                 {
                     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
@@ -9229,6 +9454,10 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
             {
                 llm = std::make_unique<llm_build_qwen35moe>(*this, params);
             } break;
+        case LLM_ARCH_QWEN35_MLA:
+            {
+                llm = std::make_unique<llm_build_qwen35_mla>(*this, params);
+            } break;
         case LLM_ARCH_MISTRAL3:
             {
                 llm = std::make_unique<llm_build_mistral3>(*this, params);
@@ -9506,6 +9735,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_QWEN3VLMOE:
         case LLM_ARCH_QWEN35:
         case LLM_ARCH_QWEN35MOE:
+        case LLM_ARCH_QWEN35_MLA:
             return LLAMA_ROPE_TYPE_IMROPE;
 
         case LLM_ARCH_GLM4:

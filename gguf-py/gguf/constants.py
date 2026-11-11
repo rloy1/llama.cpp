@@ -178,6 +178,7 @@ class Keys:
         TEMPERATURE_LENGTH           = "{arch}.attention.temperature_length"
         KEY_LENGTH_MLA               = "{arch}.attention.key_length_mla"
         VALUE_LENGTH_MLA             = "{arch}.attention.value_length_mla"
+        HEAD_COUNT_KV_REAL           = "{arch}.attention.head_count_kv_real"
         KEY_LENGTH_SWA               = "{arch}.attention.key_length_swa"
         VALUE_LENGTH_SWA             = "{arch}.attention.value_length_swa"
         SHARED_KV_LAYERS             = "{arch}.attention.shared_kv_layers"
@@ -404,6 +405,7 @@ class MODEL_ARCH(IntEnum):
     QWEN3VLMOE       = auto()
     QWEN35           = auto()
     QWEN35MOE        = auto()
+    QWEN35_MLA       = auto()
     PHI2             = auto()
     PHI3             = auto()
     PHIMOE           = auto()
@@ -643,6 +645,10 @@ class MODEL_TENSOR(IntEnum):
     ATTN_KV_B            = auto()
     ATTN_K_B             = auto()
     ATTN_V_B             = auto()
+    ATTN_K_ROPE_ROT      = auto()
+    ATTN_K_NOPE_ROT      = auto()
+    ATTN_KV_A_K_NORMED   = auto()
+    ATTN_KV_A_V          = auto()
     ATTN_Q_A_NORM        = auto()
     ATTN_KV_A_NORM       = auto()
     FFN_SUB_NORM         = auto()
@@ -887,6 +893,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.QWEN3VLMOE:       "qwen3vlmoe",
     MODEL_ARCH.QWEN35:           "qwen35",
     MODEL_ARCH.QWEN35MOE:        "qwen35moe",
+    MODEL_ARCH.QWEN35_MLA:       "qwen35-mla",
     MODEL_ARCH.PHI2:             "phi2",
     MODEL_ARCH.PHI3:             "phi3",
     MODEL_ARCH.PHIMOE:           "phimoe",
@@ -1125,6 +1132,10 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.ATTN_KV_B:                 "blk.{bid}.attn_kv_b",
     MODEL_TENSOR.ATTN_K_B:                  "blk.{bid}.attn_k_b",
     MODEL_TENSOR.ATTN_V_B:                  "blk.{bid}.attn_v_b",
+    MODEL_TENSOR.ATTN_K_ROPE_ROT:           "blk.{bid}.attn_k_rope_rot",
+    MODEL_TENSOR.ATTN_K_NOPE_ROT:           "blk.{bid}.attn_k_nope_rot",
+    MODEL_TENSOR.ATTN_KV_A_K_NORMED:        "blk.{bid}.attn_kv_a_k_normed",
+    MODEL_TENSOR.ATTN_KV_A_V:               "blk.{bid}.attn_kv_a_v",
     MODEL_TENSOR.ATTN_Q_A_NORM:             "blk.{bid}.attn_q_a_norm",
     MODEL_TENSOR.ATTN_KV_A_NORM:            "blk.{bid}.attn_kv_a_norm",
     MODEL_TENSOR.ATTN_SUB_NORM:             "blk.{bid}.attn_sub_norm",
@@ -2010,6 +2021,38 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.SSM_BETA,
         MODEL_TENSOR.SSM_ALPHA,
         MODEL_TENSOR.SSM_OUT
+    ],
+    MODEL_ARCH.QWEN35_MLA: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_POST_NORM,
+        # MLA full-attention layers
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_Q_B,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_K_NORM,
+        MODEL_TENSOR.ATTN_K_ROPE_ROT,
+        MODEL_TENSOR.ATTN_K_NOPE_ROT,
+        MODEL_TENSOR.ATTN_KV_A_K_NORMED,
+        MODEL_TENSOR.ATTN_KV_A_V,
+        MODEL_TENSOR.ATTN_K_B,
+        MODEL_TENSOR.ATTN_V_B,
+        MODEL_TENSOR.ATTN_OUT,
+        # linear-attention (gated delta net) layers, unchanged from QWEN35
+        MODEL_TENSOR.ATTN_GATE,
+        MODEL_TENSOR.ATTN_QKV,
+        MODEL_TENSOR.SSM_A,
+        MODEL_TENSOR.SSM_CONV1D,
+        MODEL_TENSOR.SSM_DT,
+        MODEL_TENSOR.SSM_NORM,
+        MODEL_TENSOR.SSM_BETA,
+        MODEL_TENSOR.SSM_ALPHA,
+        MODEL_TENSOR.SSM_OUT,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
     ],
     MODEL_ARCH.QWEN35MOE: [
         MODEL_TENSOR.TOKEN_EMBD,

@@ -13,6 +13,7 @@
 #include <cstring>
 #include <ctime>
 #include <fstream>
+#include <iomanip>
 #include <mutex>
 #include <random>
 #include <sstream>
@@ -509,7 +510,11 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
     llama_batch batch = llama_batch_init(std::min(n_batch, n_ctx*n_seq), 0, 1);
 
     std::vector<float> logits;
-    if (num_batches > 1) {
+    if (num_batches > 1 && !params.logits_file.empty()) {
+        // Only the --logits-file (KL-divergence baseline) path still needs
+        // every batch's logits accumulated into one buffer before scoring --
+        // the plain-perplexity path below now scores each batch immediately
+        // instead (see the incremental scoring block further down for why).
         logits.reserve(size_t(n_ctx) * n_vocab);
     }
 
@@ -550,6 +555,11 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
 
         // clear the KV cache
         llama_memory_clear(llama_get_memory(ctx), true);
+
+        // how many of this chunk's scored (pos >= first) positions have been
+        // processed so far -- only advances in the num_batches > 1, no-
+        // logits-file incremental-scoring path below.
+        size_t chunk_scored = 0;
 
         for (int j = 0; j < num_batches; ++j) {
             const int batch_start = start + j * n_batch;
@@ -592,7 +602,28 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
 
             if (num_batches > 1 && n_outputs > 0) {
                 const auto * batch_logits = llama_get_logits(ctx);
-                logits.insert(logits.end(), batch_logits, batch_logits + size_t(n_outputs) * n_vocab);
+                if (!params.logits_file.empty()) {
+                    logits.insert(logits.end(), batch_logits, batch_logits + size_t(n_outputs) * n_vocab);
+                } else {
+                    // Score this batch immediately instead of accumulating every
+                    // batch's logits for the whole chunk before scoring once --
+                    // avoids ever needing logits.reserve(n_ctx * n_vocab), which is
+                    // ~260GB at n_ctx=262144 for a 248k-vocab model (confirmed real:
+                    // this is exactly what crashed with std::bad_alloc, immediately
+                    // after tokenization, on a real run). This also makes the tool's
+                    // memory profile match real on-device inference, which never
+                    // holds more than one batch's logits at a time either. Safe
+                    // because num_batches > 1 requires n_batch < n_ctx, which
+                    // collapses n_seq (and thus n_seq_batch) to 1 -- see the
+                    // GGML_ASSERT above -- so there's never more than one
+                    // sequence's worth of output to account for here.
+                    llama_token * tokens_data = tokens.data() + start + first + chunk_scored;
+                    process_logits(n_vocab, batch_logits, tokens_data, n_outputs,
+                            workers, nll, nll2,
+                            logit_history.data() + start + first + chunk_scored,
+                            prob_history.data()  + start + first + chunk_scored);
+                    chunk_scored += n_outputs;
+                }
             }
         }
 
@@ -611,19 +642,24 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
         }
 
         for (int seq = 0; seq < n_seq_batch; seq++) {
-            const float * all_logits = num_batches > 1 ? logits.data() : llama_get_logits_ith(ctx, seq*n_ctx + first);
-
-            llama_token * tokens_data = tokens.data() + start + seq*n_ctx + first;
-            if (!params.logits_file.empty()) {
-                process_logits(logits_stream, n_vocab, all_logits,
-                        tokens_data, n_ctx - 1 - first,
-                        workers, log_probs, nll, nll2);
+            if (num_batches > 1 && params.logits_file.empty()) {
+                // already scored incrementally per-batch above -- see the
+                // note by chunk_scored
             } else {
-                process_logits(n_vocab, all_logits,
-                        tokens_data, n_ctx - 1 - first,
-                        workers, nll, nll2,
-                        logit_history.data() + start + seq*n_ctx + first,
-                        prob_history.data()  + start + seq*n_ctx + first);
+                const float * all_logits = num_batches > 1 ? logits.data() : llama_get_logits_ith(ctx, seq*n_ctx + first);
+
+                llama_token * tokens_data = tokens.data() + start + seq*n_ctx + first;
+                if (!params.logits_file.empty()) {
+                    process_logits(logits_stream, n_vocab, all_logits,
+                            tokens_data, n_ctx - 1 - first,
+                            workers, log_probs, nll, nll2);
+                } else {
+                    process_logits(n_vocab, all_logits,
+                            tokens_data, n_ctx - 1 - first,
+                            workers, nll, nll2,
+                            logit_history.data() + start + seq*n_ctx + first,
+                            prob_history.data()  + start + seq*n_ctx + first);
+                }
             }
             count += n_ctx - first - 1;
 
@@ -656,6 +692,28 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
     }
 
     llama_batch_free(batch);
+
+    if (!params.token_nll_file.empty()) {
+        // prob_history is sized to the full corpus (tokens.size()) but only
+        // positions the chunking scheme actually scored (roughly the second
+        // half of each chunk -- see the `first = n_ctx/2` comment above) got
+        // a real value written; everything else is still its default-
+        // constructed 0.0f. A genuine softmax probability is always > 0, so
+        // that's a safe, correct way to tell "scored" from "never touched" --
+        // confirmed by reading process_logits()'s write pattern, not assumed.
+        std::ofstream nll_stream(params.token_nll_file);
+        if (!nll_stream.is_open()) {
+            LOG_ERR("%s: failed to open %s for writing per-token NLL\n", __func__, params.token_nll_file.c_str());
+        } else {
+            LOG_INF("%s: saving per-token NLL to %s\n", __func__, params.token_nll_file.c_str());
+            nll_stream << std::setprecision(8);
+            for (size_t i = 0; i < prob_history.size(); ++i) {
+                if (prob_history[i] > 0.0f) {
+                    nll_stream << i << ' ' << -std::log((double) prob_history[i]) << '\n';
+                }
+            }
+        }
+    }
 
     return {tokens, ppl, logit_history, prob_history};
 }

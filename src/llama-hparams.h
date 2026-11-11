@@ -62,6 +62,14 @@ struct llama_hparams {
     uint32_t n_embd_head_k_mla_impl = 0;
     uint32_t n_embd_head_v_mla_impl = 0;
 
+    // qwen35-mla: the *real* (pre-MLA-absorption) kv-head count, needed for
+    // the exact K-rope path's raw k_proj reshape (k_proj's un-compressed
+    // output width is n_head_kv_real * n_embd_head_v_mla, a different
+    // number than n_head_kv_arr, which this arch sets to 1 globally for
+    // the k-only MLA cache's own sizing -- see llama-model.cpp's
+    // LLM_ARCH_QWEN35_MLA hparams block.
+    uint32_t n_head_kv_real = 0;
+
     // for WavTokenizer
     struct llama_hparams_posnet   posnet;
     struct llama_hparams_convnext convnext;
@@ -71,6 +79,30 @@ struct llama_hparams {
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_arr;
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_kv_arr;
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_ff_arr;
+
+    // Per-layer MLA kv_lora_rank ("ragged" latent cache). 0 means "not set",
+    // in which case n_lora_kv_l() falls back to the n_lora_kv scalar, so every
+    // arch that never fills this array behaves exactly as before.
+    //
+    // Why a per-layer rank is worth the plumbing: the latent rank is the whole
+    // KV cache width, and the layers do NOT need it equally. A greedy search
+    // over an 8-layer MLA conversion of Qwen3.5-4B found that spending the same
+    // total budget unevenly ({192,320,384,256,256,192,256,192} instead of a
+    // uniform 256 everywhere) cut teacher-forced code-NLL from 0.031 to 0.0035
+    // at byte-identical cache size -- the rank a layer can use is a property of
+    // that layer, not of the model.
+    std::array<uint32_t, LLAMA_MAX_LAYERS> n_lora_kv_arr;
+
+    // Per-layer k/v head widths, consulted by n_embd_head_k()/n_embd_head_v()
+    // ahead of the full/swa pair. 0 means "not set" -> fall through to the
+    // existing full/swa logic, so this is inert for every other arch.
+    //
+    // These exist because the KV cache is sized from n_embd_k_gqa(il), which is
+    // n_embd_head_k(il) * n_head_kv(il). A per-layer rank only actually SHRINKS
+    // the cache if that accessor varies per layer too; otherwise every layer
+    // still reserves the maximum width and the saving is purely notional.
+    std::array<uint32_t, LLAMA_MAX_LAYERS> n_embd_head_k_arr;
+    std::array<uint32_t, LLAMA_MAX_LAYERS> n_embd_head_v_arr;
 
     uint32_t n_layer_dense_lead = 0;
     uint32_t n_lora_q           = 0;
@@ -269,6 +301,10 @@ struct llama_hparams {
     // dimension of key/value embeddings for each head (per layer)
     uint32_t n_embd_head_k(uint32_t il = 0) const;
     uint32_t n_embd_head_v(uint32_t il = 0) const;
+
+    // MLA latent rank for a given layer; falls back to the n_lora_kv scalar
+    // when n_lora_kv_arr was never filled (i.e. every arch but qwen35-mla)
+    uint32_t n_lora_kv_l(uint32_t il = 0) const;
 
     // dimension of key embeddings across all k-v heads
     uint32_t n_embd_k_gqa(uint32_t il = 0) const;

@@ -2,6 +2,7 @@
 
 #include "log.h"
 
+#include <algorithm>
 #include <cmath>
 #include <string>
 
@@ -51,12 +52,18 @@ template <bool abort>
 void common_debug_print_tensor(uint8_t * data, ggml_type type, const int64_t * ne, const size_t * nb, int64_t n) {
     GGML_ASSERT(n > 0);
     float sum = 0;
+    float sum_abs = 0;
+    float max_abs = 0;
+    int64_t count = 0;
     for (int64_t i3 = 0; i3 < ne[3]; i3++) {
         for (int64_t i2 = 0; i2 < ne[2]; i2++) {
             for (int64_t i1 = 0; i1 < ne[1]; i1++) {
                 for (int64_t i0 = 0; i0 < ne[0]; i0++) {
                     const float v = common_ggml_get_float_value(data, type, nb, i0, i1, i2, i3);
                     sum += v;
+                    sum_abs += std::fabs(v);
+                    max_abs = std::max(max_abs, std::fabs(v));
+                    count++;
                 }
             }
         }
@@ -91,7 +98,7 @@ void common_debug_print_tensor(uint8_t * data, ggml_type type, const int64_t * n
             LOG(INDENT INDENT "],\n");
         }
         LOG(INDENT "]\n");
-        LOG(INDENT "sum = %f\n", sum);
+        LOG(INDENT "sum = %f, mean_abs = %f, max_abs = %f\n", sum, sum_abs / (float) count, max_abs);
     }
 
     if constexpr (abort) {

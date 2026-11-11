@@ -38,8 +38,6 @@ static bool run(llama_context * ctx, const common_params & params) {
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
-    base_callback_data cb_data;
-
     common_params params;
 
     common_init();
@@ -48,13 +46,16 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // temporary diagnostic filter for the exact-K/V long-context blowup
+    // investigation -- only the tensors closest to the FA boundary, to keep
+    // a 49152-token run's log volume sane. Not meant to stay filtered.
+    base_callback_data cb_data(params, {
+        "Qcur_final", "Kcur", "Vcur", "kv_cmpr_exact", "k_nope_exact", "attn_pregate",
+    });
+
     llama_backend_init();
     llama_numa_init(params.numa);
 
-    // pass the callback to the backend scheduler
-    // it will be executed for each node during the graph computation
-    params.cb_eval = common_debug_cb_eval<false>;
-    params.cb_eval_user_data = &cb_data;
     params.warmup = false;
 
     // init
